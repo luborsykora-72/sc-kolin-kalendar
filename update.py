@@ -35,23 +35,28 @@ def main():
     # labels (e.g. "24. kolo, 18. 11. 2026 - 18:00") and team headings.
     # Extracting stripped text also works if the HTML wrapper changes.
     lines = [' '.join(s.split()) for s in soup.stripped_strings]
+    # Dates and team names may be split across several HTML text nodes.
+    # Joining text nodes makes the parser independent of that layout.
+    text = ' '.join(lines)
     matches = {}
-    for i, line in enumerate(lines):
-        m = DATE_RE.search(line)
-        if not m:
-            continue
-        teams = next((candidate for candidate in lines[i+1:i+12]
-                      if TEAM_RE.search(candidate) and not DATE_RE.search(candidate)
-                      and len(candidate) < 120), None)
-        if not teams:
-            continue
+    for m in DATE_RE.finditer(text):
+        # Search only until the next round, never pair a date with a later match.
+        next_date = DATE_RE.search(text, m.end())
+        fragment = text[m.end():next_date.start() if next_date else m.end()+500]
+        team_match = re.search(r'([\wÁ-ž][\wÁ-ž .-]{1,65}?)\s+-\s+([\wÁ-ž][\wÁ-ž .-]{1,65}?)\s*(?=Vstupenky|Onlajn|Reportáž|\d{1,2}:\d{1,2}|$)', fragment, re.I)
+        # Prefer a nearby HTML heading when the generic text pattern fails.
+        if team_match:
+            teams = team_match.group(0).strip()
+        else:
+            nearby = re.search(r'((?:Kolín\s+-\s+[^|]{2,65})|(?:[^|]{2,65}\s+-\s+Kolín))', fragment)
+            if not nearby:
+                continue
+            teams = nearby.group(1).strip()
         parts = {k: int(v) for k, v in m.groupdict().items()}
         start = datetime(parts['year'], parts['month'], parts['day'],
                          parts['hour'], parts['minute'], tzinfo=TZ)
-        # Stable ID per round and season, so time changes update the event.
         season = parts['year'] if parts['month'] >= 7 else parts['year'] - 1
-        key = (season, parts['round'])
-        matches[key] = (start, teams)
+        matches[(season, parts['round'])] = (start, teams)
     print(f'DIAGNOSTIKA: HTML znaku={len(html)}, textovych radku={len(lines)}, zapasu={len(matches)}', flush=True)
     print('DIAGNOSTIKA: Prvnich 30 textovych radku:', repr(lines[:30]), flush=True)
     if len(matches) < 20:
