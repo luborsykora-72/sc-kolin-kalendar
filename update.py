@@ -119,6 +119,12 @@ def main():
         html = response.read().decode('utf-8', errors='replace')
     matches = parse(html)
     if len(matches) < 20:
+   
+        print("DIAGNOSTIKA: Pocet zapasu:", len(matches), flush=True)
+        print("DIAGNOSTIKA: Zdroj:", URL, flush=True)
+        print("DIAGNOSTIKA: Delka HTML:", len(html), flush=True)
+        print("DIAGNOSTIKA: Ukazka HTML:", repr(html[:1500]), flush=True)
+
         raise RuntimeError(f'Nalezeno jen {len(matches)} zápasů; kalendář nebude přepsán.')
     Path('kalendar.ics').write_bytes(build_ics(matches))
     print(f'Vygenerováno {len(matches)} zápasů; první: {matches[0][1].isoformat()}')
