@@ -1,134 +1,80 @@
-"""SC Kolín fan calendar: scrape official A-team fixtures and publish ICS."""
 import re
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
 from bs4 import BeautifulSoup
 
 URL = 'https://sckolin.cz/matches/MUZ'
 TZ = ZoneInfo('Europe/Prague')
-ROUND = re.compile(r'(?P<round>\d+)\.\s*kolo\s*,\s*(?P<day>\d{1,2})\.\s*(?P<month>\d{1,2})\.\s*(?P<year>20\d{2})\s*[-–]\s*(?P<hour>\d{1,2}):(?P<minute>\d{2})', re.I)
-TEAM = re.compile(r'Kolín', re.I)
+DATE_RE = re.compile(r'(?P<round>\d+)\.\s*kolo\s*,\s*(?P<day>\d{1,2})\.\s*(?P<month>\d{1,2})\.\s*(?P<year>20\d{2})\s*[-–]\s*(?P<hour>\d{1,2}):(?P<minute>\d{2})', re.I)
+TEAM_RE = re.compile(r'Kolín\s*-|\s*-\s*Kolín\b', re.I)
 
-
-def clean(value):
-    return ' '.join(value.split())
-
-
-def ical_escape(value):
+def escape(value):
     return str(value).replace('\\', '\\\\').replace(';', '\\;').replace(',', '\\,').replace('\n', '\\n')
 
-
 def fold(line):
-    """Fold ICS content lines at max 75 UTF-8 octets."""
-    out = []
-    part = ''
-    for char in line:
-        if len((part + char).encode('utf-8')) > 75:
-            out.append(part)
-            part = ' ' + char
+    result, current = [], ''
+    for ch in line:
+        if len((current + ch).encode('utf-8')) > 75:
+            result.append(current)
+            current = ' ' + ch
         else:
-            part += char
-    out.append(part)
-    return '\r\n'.join(out)
+            current += ch
+    result.append(current)
+    return '\r\n'.join(result)
 
-
-def parse(html):
+def main():
+    request = urllib.request.Request(URL, headers={'User-Agent': 'Mozilla/5.0 SC-Kolin-Calendar/1.0'})
+    with urllib.request.urlopen(request, timeout=40) as response:
+        html = response.read().decode('utf-8', errors='replace')
     soup = BeautifulSoup(html, 'html.parser')
     for element in soup(['script', 'style', 'noscript']):
         element.decompose()
-    # Restrict to the full match list when possible, to avoid the nearest-match duplicate.
-    heading = soup.find(string=lambda s: s and clean(s).lower() == 'všechny zápasy')
-    if heading:
-        parent = heading.parent
-        while parent and parent.name not in ('h1', 'h2', 'h3', 'h4'):
-            parent = parent.parent
-        if parent:
-            text = []
-            for node in parent.next_elements:
-                if getattr(node, 'name', None) in ('h1', 'h2', 'h3') and node is not parent:
-                    if clean(node.get_text(' ', strip=True)).lower() == 'partneři kolínského hokeje':
-                        break
-                if isinstance(node, str):
-                    val = clean(node)
-                    if val:
-                        text.append(val)
-            lines = text
-        else:
-            lines = [clean(s) for s in soup.stripped_strings]
-    else:
-        lines = [clean(s) for s in soup.stripped_strings]
-
+    # The club's page contains a heading "Všechny zápasy" followed by date
+    # labels (e.g. "24. kolo, 18. 11. 2026 - 18:00") and team headings.
+    # Extracting stripped text also works if the HTML wrapper changes.
+    lines = [' '.join(s.split()) for s in soup.stripped_strings]
     matches = {}
     for i, line in enumerate(lines):
-        m = ROUND.search(line)
+        m = DATE_RE.search(line)
         if not m:
             continue
-        # Team fixture must follow the round/date line, not a score or navigation label.
-        team_line = None
-        for candidate in lines[i + 1:i + 12]:
-            if ROUND.search(candidate):
-                break
-            if TEAM.search(candidate) and ' - ' in candidate and len(candidate) < 140:
-                team_line = candidate
-                break
-        if not team_line:
+        teams = next((candidate for candidate in lines[i+1:i+12]
+                      if TEAM_RE.search(candidate) and not DATE_RE.search(candidate)
+                      and len(candidate) < 120), None)
+        if not teams:
             continue
-        gd = {k: int(v) for k, v in m.groupdict().items()}
-        start = datetime(gd['year'], gd['month'], gd['day'], gd['hour'], gd['minute'], tzinfo=TZ)
-        key = (gd['year'], gd['round'])
-        matches[key] = (gd['round'], start, team_line)
-    return sorted(matches.values(), key=lambda x: x[1])
-
-
-def build_ics(matches):
-    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    rows = [
-        'BEGIN:VCALENDAR', 'VERSION:2.0',
-        'PRODID:-//SC Kolin Fan Calendar//CS',
-        'CALSCALE:GREGORIAN', 'METHOD:PUBLISH',
-        'X-WR-CALNAME:SC Kolín – A-tým',
-        'X-WR-TIMEZONE:Europe/Prague',
-        'REFRESH-INTERVAL;VALUE=DURATION:PT6H',
-    ]
-    for round_no, start, teams in matches:
-        end = start + timedelta(hours=2, minutes=30)
-        home = teams.startswith('Kolín - ')
-        rows.extend([
-            'BEGIN:VEVENT',
-            f'UID:sckolin-{start.year}-round-{round_no}@fan-calendar.local',
-            f'DTSTAMP:{stamp}',
-            f'DTSTART:{start.strftime("%Y%m%dT%H%M%S")}',
-            f'DTEND:{end.strftime("%Y%m%dT%H%M%S")}',
-            f'SUMMARY:{ical_escape(teams)}',
-            f'DESCRIPTION:{ical_escape(f"SC Kolín, {round_no}. kolo. Zdroj: {URL}")}',
-            f'LOCATION:{ical_escape("Zimní stadion Kolín" if home else "Venkovní utkání – ověř místo u pořadatele")}',
-            'BEGIN:VALARM', 'TRIGGER:-PT1H', 'ACTION:DISPLAY',
-            f'DESCRIPTION:{ical_escape(teams)}', 'END:VALARM',
-            'END:VEVENT',
-        ])
-    rows.append('END:VCALENDAR')
-    return ('\r\n'.join(fold(row) for row in rows) + '\r\n').encode('utf-8')
-
-
-def main():
-    req = urllib.request.Request(URL, headers={'User-Agent': 'Mozilla/5.0 (compatible; SC-Kolin-Calendar/1.1)'})
-    with urllib.request.urlopen(req, timeout=35) as response:
-        html = response.read().decode('utf-8', errors='replace')
-    matches = parse(html)
+        parts = {k: int(v) for k, v in m.groupdict().items()}
+        start = datetime(parts['year'], parts['month'], parts['day'],
+                         parts['hour'], parts['minute'], tzinfo=TZ)
+        # Stable ID per round and season, so time changes update the event.
+        season = parts['year'] if parts['month'] >= 7 else parts['year'] - 1
+        key = (season, parts['round'])
+        matches[key] = (start, teams)
+    print(f'DIAGNOSTIKA: HTML znaku={len(html)}, textovych radku={len(lines)}, zapasu={len(matches)}', flush=True)
+    print('DIAGNOSTIKA: Prvnich 30 textovych radku:', repr(lines[:30]), flush=True)
     if len(matches) < 20:
-   
-        print("DIAGNOSTIKA: Pocet zapasu:", len(matches), flush=True)
-        print("DIAGNOSTIKA: Zdroj:", URL, flush=True)
-        print("DIAGNOSTIKA: Delka HTML:", len(html), flush=True)
-        print("DIAGNOSTIKA: Ukazka HTML:", repr(html[:1500]), flush=True)
-
-        raise RuntimeError(f'Nalezeno jen {len(matches)} zápasů; kalendář nebude přepsán.')
-    Path('kalendar.ics').write_bytes(build_ics(matches))
-    print(f'Vygenerováno {len(matches)} zápasů; první: {matches[0][1].isoformat()}')
-
+        raise RuntimeError(f'Nalezeno jen {len(matches)} zapasu; kalendar nebude prepsan.')
+    now = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    output = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//SC Kolin Fan Calendar//CS',
+              'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'X-WR-CALNAME:SC Kolín – A-tým',
+              'X-WR-TIMEZONE:Europe/Prague']
+    for (season, round_number), (start, teams) in sorted(matches.items(), key=lambda item: item[1][0]):
+        end = start + timedelta(hours=2, minutes=30)
+        output.extend(['BEGIN:VEVENT', f'UID:sckolin-{season}-{round_number}@fan-calendar.local',
+                       f'DTSTAMP:{now}',
+                       f'DTSTART:{start.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}',
+                       f'DTEND:{end.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}',
+                       f'SUMMARY:{escape(teams)}',
+                       f'DESCRIPTION:{escape(str(round_number) + ". kolo – zdroj: " + URL)}',
+                       f'URL:{URL}',
+                       'BEGIN:VALARM', 'TRIGGER:-PT1H', 'ACTION:DISPLAY',
+                       'DESCRIPTION:Za hodinu začíná zápas SC Kolín', 'END:VALARM',
+                       'END:VEVENT'])
+    output.append('END:VCALENDAR')
+    Path('kalendar.ics').write_bytes(('\r\n'.join(fold(line) for line in output) + '\r\n').encode('utf-8'))
+    print(f'Vygenerovano {len(matches)} zapasu.', flush=True)
 
 if __name__ == '__main__':
     main()
